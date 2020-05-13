@@ -1,0 +1,352 @@
+#!/bin/bash
+
+# The missing command from the sort/join/grep suite allowing
+# mapreduce-style operations on the command line.  Provides multiple
+# aggregate operations (sum/avg/count/...) on plain tsv as well as csv
+# or json.
+
+FORMAT=auto
+SEPARATOR=''
+FIELDS=''
+EXPR='1'
+OP='sum'
+JOIN_SEP=''
+SORTED=''
+HEADER=''
+NO_INPUT_HEADER=''
+NO_OUTPUT_HEADER=''
+TMP=''
+SOURCES=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x|--format)
+            FORMAT="$2"
+            shift
+            shift
+            ;;
+        -t|--separator)
+            SEPARATOR="$2"
+            shift
+            shift
+            ;;
+        -o|--operator)
+            OP="$2"
+            shift
+            shift
+            ;;
+        -f|--field)
+            FIELDS="$2"
+            shift
+            shift
+            ;;
+        -e|--expr)
+            EXPR="$2"
+            shift
+            shift
+            ;;
+        -j|--join-separator)
+            JOIN_SEP="$2"
+            shift
+            shift
+            ;;
+        -S|--sorted)
+            SORTED="$1"
+            shift
+            ;;
+        -h|--header)
+            HEADER="$2"
+            shift
+            shift
+            ;;
+        -I|--no-input-header)
+            NO_INPUT_HEADER="-I"
+            shift
+            ;;
+        -O|--no-output-header)
+            NO_OUTPUT_HEADER="-O"
+            shift
+            ;;
+        -H|--no-headers)
+            NO_INPUT_HEADER="-I"
+            NO_OUTPUT_HEADER="-O"
+            shift
+            ;;
+        *)    # unknown option
+            if [ "x$EXPR" = "x" ]; then
+                EXPR="$1"
+            else
+                SOURCES+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+########################################################################
+
+function finish() {
+    if [ -f "$TMP" ]; then
+        rm -f "$TMP"
+    fi
+}
+trap finish EXIT
+
+# ensures first source is a plain file which can be read multiple times
+function reset_sources() {
+    if [ "${#SOURCES[@]}" -ge 1 ] && [ -f "${SOURCES[0]}" ]; then
+        # nothing to do here - ensures idempotency
+        true
+    else
+        TMP=$(mktemp)
+        BYTES="${QTOOLS_PREFETCH_SIZE:-4096}"
+        if [ "${#SOURCES[@]}" -ge 1 ]; then
+            dd bs=1 count="$BYTES" if="${SOURCES[0]}" of="$TMP" 2>/dev/null
+        else
+            dd bs=1 count="$BYTES" of="$TMP" 2>/dev/null
+            SOURCES=("/dev/stdin")
+        fi
+        SOURCES=("$TMP" "${SOURCES[@]}")
+    fi
+}
+
+function getsep() {
+    perl -ne '++$h{$1}{$.}while/([,;:!|\t\/\$])/g;
+END {
+  $min = -1;
+  while (($s,$rh)=each%h) {
+    @v=(values%$rh);
+    $sum=0;
+    $sum+=$_ foreach@v;
+    $avg=$sum/($#v+1);
+    $diff=0;
+    $diff+=abs($avg-$_)foreach@v;
+    if ($min<0||$diff<$min||$diff==$min&&$sum>$minsum) {
+      $min=$diff;
+      $minsum=$sum;
+      $sep=$s;
+    }
+  }
+  print"$sep\n";
+}' "$@"
+}
+
+# treats first arg as a list of headers
+# maps second arg to corresponding header
+function lookup_fields() {
+    header="$1"
+    fields="$2"
+    perl -e '@h=split(/,/,"'"$header"'");%h=map{$h[$_]//$_=>$_}(0..$#h);print join(",",map{/^(\w+:)?(.*)/;"$1".($h{$2}//$2)}split(/,/,"'"$fields"'"))'
+}
+
+# given a json array on each line of input, flattens the leading non-object
+# elements into a tsv row
+function splice_json() {
+    perl -pe 's/^\[//;s/\]$//;while(s{(^|\t)(?:("(?:[^"]|\\.)*")|([^,{}""]*)),}{$1.($2//$3)."\t"}e){}' "$@"
+}
+
+function csv2tsv() {
+    perl -CS -MText::CSV -e '
+ $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", binary=>1, allow_loose_quotes=>1});
+ %h=("\t" => "t", "\n" => "n");
+ while ($r=$csv->getline(*STDIN)) {
+   print join("\t", map {s/(["\t\n\\])/"\\".($h{$1}||$1)/ge; $_} @$r), "\n";
+ }
+ $csv->eof or $csv->error_diag();' "$@"
+}
+
+function tsv2csv() {
+    perl -CS -MText::CSV -F'\t' -ane 'BEGIN {
+   $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", eol=>"\n", binary=>1});
+   %h=("t" => "\t", "n" => "\n");
+ }
+ chomp @F;
+ $csv->print(*STDOUT, [map {s/\\(.)/$h{$1}||$1/ge; $_} @F]);' "$@"
+}
+
+function tsv2json() {
+    header="$1"
+    shift
+    perl -CS -F'\t' -ane 'BEGIN{%h=map{$i++=>$_}split(/,/,"'"$header"'")}
+  chomp @F;
+  print "{", join(", ", map{"\"$h{$_}\": $F[$_]"}(0..$#F)),"}\n";' "$@"
+}
+
+########################################################################
+
+if [ "x$FORMAT" = "xauto" ]; then
+    reset_sources
+    if egrep . "${SOURCES[0]}" | head -1 | egrep -q ' *{'; then
+        FORMAT=json
+    else
+        SEPARATOR=$(head -5 "${SOURCES[0]}" | getsep)
+        if [ "x$SEPARATOR" = "x," ]; then
+            FORMAT=csv
+        elif [ "x$SEPARATOR" != "x" ]; then
+            FORMAT=tsv
+        else
+            echo "can't detect format, specify with -x/--format" >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [ "x$SEPARATOR" = 'x' ]; then
+    case "$FORMAT" in
+        tsv)
+            SEPARATOR=$'\t'
+            ;;
+        *)
+            SEPARATOR=','
+            ;;
+    esac
+fi
+if [ "$SEPARATOR" = $'\t' ]; then
+    PERL_SEP='\t'
+else
+    PERL_SEP="$SEPARATOR"
+fi
+
+IFS=',' read -r -a EXPR_ARRAY <<< "$EXPR"
+IFS=',' read -r -a OP_ARRAY <<< "$OP"
+OP_EXPR=''
+OUT_EXPR=''
+CLEAR_EXPR=''
+i=0
+len=${#EXPR_ARRAY[@]}
+for (( i=0; i<$len; i++ )); do
+    op=${OP_ARRAY[$i]}
+    if [ "x$op" = "x" ]; then
+        op=${OP_ARRAY[-1]}
+    fi
+    case "$op" in
+        count)
+            OP_EXPR="$OP_EXPR ++\$a$i;"
+            OUT_EXPR="$OUT_EXPR, \$a$i,"
+            ;;
+        sum)
+            OP_EXPR="$OP_EXPR \$a$i+=\$F[\$e[$i]];"
+            OUT_EXPR="$OUT_EXPR, \$a$i,"
+            ;;
+        min)
+            OP_EXPR="$OP_EXPR \$a$i = \$F[\$e[$i]] unless length(\$a$i) and \$a$i < \$F[\$e[$i]];"
+            OUT_EXPR="$OUT_EXPR, \$a$i,"
+            ;;
+        max)
+            OP_EXPR="$OP_EXPR \$a$i = \$F[\$e[$i]] unless length(\$a$i) and \$a$i > \$F[\$e[$i]];"
+            OUT_EXPR="$OUT_EXPR, \$a$i,"
+            ;;
+        avg)
+            OP_EXPR="$OP_EXPR \$a$i+=\$F[\$e[$i]]; ++\$c;"
+            OUT_EXPR="$OUT_EXPR, \$a$i/\$c,"
+            CLEAR_EXPR="$CLEAR_EXPR \$c=0;"
+            ;;
+        variance|stdev)
+            OP_EXPR="$OP_EXPR \$a$i+=\$F[\$e[$i]]; \$a2$i+=\$F[\$e[$i]]*\$F[\$e[$i]]; ++\$c;"
+            CLEAR_EXPR="$CLEAR_EXPR \$c=0;"
+            if [ "$op" = "variance" ]; then
+                OUT_EXPR="$OUT_EXPR, \$a2$i/\$c - \$a$i*\$a$i/(\$c*\$c),"
+            else
+                OUT_EXPR="$OUT_EXPR, sqrt(\$a2$i/\$c - \$a$i*\$a$i/(\$c*\$c)),"
+            fi
+            ;;
+        median)
+            OP_EXPR="$OP_EXPR push @a$i, \$F[\$e[$i]];"
+            OUT_EXPR="$OUT_EXPR, ((sort {\$a<=>\$b} @a$i)[\$#a$i/2]),"
+            CLEAR_EXPR="$CLEAR_EXPR @a$i=();"
+            ;;
+        join)
+            OP_EXPR="$OP_EXPR \$a$i.='$JOIN_SEP'if length\$a$i; \$a$i.=\$F[\$e[$i]];"
+            OUT_EXPR="$OUT_EXPR, \$a$i,"
+            CLEAR_EXPR="$CLEAR_EXPR \$a$i='';"
+            ;;
+        *)
+            echo "unknown operator: $OP"
+            exit 1
+            ;;
+    esac
+    CLEAR_EXPR="$CLEAR_EXPR \$a$i='';"
+done
+OUT_EXPR=${OUT_EXPR%,}
+if [ -z "$FIELDS" ]; then
+    OUT_EXPR="${OUT_EXPR#,}"
+else
+    OUT_EXPR='$p '"${OUT_EXPR}"
+fi
+
+case "$FORMAT" in
+    tsv)
+        if [ -z "$NO_OUTPUT_HEADER" ]; then
+            if [ -n "${FIELDS}" ]; then
+                echo -n "${FIELDS}," | tr , "${SEPARATOR}"
+            fi
+            echo "${EXPR}_${OP}" | sed 's/,/_'"${OP}$SEPARATOR"'/g'
+        fi
+        if echo "$FIELDS,$EXPR" | egrep -vq '^[,~0-9]*$'; then
+            if [ -z "$HEADER" ]; then
+                if [ -n "$NO_INPUT_HEADER" ]; then
+                    echo "error: no headers and fields referred to by name" >&2
+                    exit 1
+                fi
+                reset_sources
+                HEADER=$(head -1 "${SOURCES[0]}" | tr "$SEPARATOR" ,)
+            fi
+            if echo "$FIELDS" | egrep -vq '^[,~0-9]*$'; then
+                FIELDS=$(lookup_fields "$HEADER" "$FIELDS")
+            fi
+            if echo "$EXPR" | egrep -vq '^[,~0-9]*$'; then
+                EXPR=$(lookup_fields "$HEADER" "$EXPR")
+            fi
+        fi
+        if [ -z "$FIELDS" ]; then
+            SORTED="-S"
+        fi
+        if [ -z "$SORTED" ]; then
+            CMD=(qsort $NO_INPUT_HEADER -O -t "$SEPARATOR" -f "$FIELDS")
+        else
+            if [ -n "$NO_INPUT_HEADER" ]; then
+                CMD=(cat)
+            else
+                CMD=(tail --quiet -n +2)
+            fi
+        fi
+        # TODO: shard when grouping on fields
+        cat "${SOURCES[@]}" | "${CMD[@]}" |\
+            perl -F"$PERL_SEP" -ane '
+BEGIN { @f = split(",", "'"$FIELDS"'"); @e = split(",", "'"$EXPR"'"); }
+END { $p=$g; print join("'"$PERL_SEP"'", '"$OUT_EXPR"'), "\n" if defined $p; }
+
+chomp @F;
+$g = join("'"$PERL_SEP"'", @F[@f]);
+print STDERR "empty line at $.: <$_>\n" if $g eq "\t";
+
+if ($g ne $p) {
+  print join("'"$PERL_SEP"'", '"$OUT_EXPR"'), "\n" if defined $p;
+  $p = $g;
+  '"$CLEAR_EXPR"'
+}
+
+'"$OP_EXPR"'
+';
+        ;;
+    csv)
+        cat "${SOURCES[@]}" |\
+            csv2tsv |\
+            qagg $NO_INPUT_HEADER -x tsv -t $'\t' -o "$OP" -f "$FIELDS" -e "$EXPR" -j "$JOIN_SEP" -h "$HEADER" |\
+            tsv2csv
+        ;;
+    json)
+        JQ_FIELDS=$(perl -e 'print join(", ", map {s/^\w*://;".$_"} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        JQ_EXPR=$(perl -e 'print join(", ", map {s/^\w*://;".$_"} split(/\s*,\s*/, "'"$EXPR"'"))')
+        AGG_FIELDS=$(perl -e 'print join(",", map {s/^(\w*:)?.*/$1.$i++/e;$_} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        AGG_EXPR=$(perl -e '$i=1+("'"$FIELD"'"=~tr/,//); print join(",", map {s/^(\w*:)?.*/$1.$i++/e;$_} split(/\s*,\s*/, "'"$EXPR"'"))')
+        cat "${SOURCES[@]}" | jq -c "[$JQ_FIELDS, $JQ_EXPR]" |\
+            splice_json |\
+            qagg -H -x tsv -t $'\t' -o "$OP" -f "$AGG_FIELDS" -e "$AGG_EXPR" -j "$JOIN_SEP" |\
+            tsv2json "${FIELDS},${EXPR}_${OP}"
+        ;;
+    *)
+        echo "error: unknown format: $FORMAT" >&2
+        exit 1
+        ;;
+esac

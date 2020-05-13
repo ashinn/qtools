@@ -1,0 +1,233 @@
+#!/bin/bash
+
+# A nicer grep(1), supporting restricting to any number of named or
+# indexed fields, for tsv, csv and json.  ^ and $ anchors bind to the
+# start and end of the field, not line, respectively.
+
+FORMAT=auto
+SEPARATOR=''
+FIELDS=''
+IGNORE_CASE=''
+INVERT_MATCH=''
+HEADER=''
+NO_INPUT_HEADER=''
+NO_OUTPUT_HEADER=''
+TMP=''
+QUERY=''
+SOURCES=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x|--format)
+            FORMAT="$2"
+            shift
+            shift
+            ;;
+        -t|--separator)
+            SEPARATOR="$2"
+            shift
+            shift
+            ;;
+        -f|--field)
+            FIELDS="$2"
+            shift
+            shift
+            ;;
+        -i|--ignore-case)
+            IGNORE_CASE="$1"
+            shift
+            ;;
+        -v|--invert-match)
+            INVERT_MATCH="$1"
+            shift
+            ;;
+        -h|--header)
+            HEADER="$2"
+            shift
+            shift
+            ;;
+        -I|--no-input-header)
+            NO_INPUT_HEADER="1"
+            shift
+            ;;
+        -O|--no-output-header)
+            NO_OUTPUT_HEADER="1"
+            shift
+            ;;
+        -H|--no-headers)
+            NO_INPUT_HEADER="1"
+            NO_OUTPUT_HEADER="1"
+            shift
+            ;;
+        *)
+            if [ -z "$QUERY" ]; then
+                QUERY="$1"
+            else
+                SOURCES+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+########################################################################
+
+function finish() {
+    if [ -f "$TMP" ]; then
+        rm -f "$TMP"
+    fi
+}
+trap finish EXIT
+
+# ensures first source is a plain file which can be read multiple times
+function reset_sources() {
+    if [ "${#SOURCES[@]}" -ge 1 ] && [ -f "${SOURCES[0]}" ]; then
+        # nothing to do here - ensures idempotency
+        true
+    else
+        TMP=$(mktemp)
+        BYTES="${QTOOLS_PREFETCH_SIZE:-4096}"
+        if [ "${#SOURCES[@]}" -ge 1 ]; then
+            dd bs=1 count="$BYTES" if="${SOURCES[0]}" of="$TMP" 2>/dev/null
+        else
+            dd bs=1 count="$BYTES" of="$TMP" 2>/dev/null
+            SOURCES=("/dev/stdin")
+        fi
+        SOURCES=("$TMP" "${SOURCES[@]}")
+    fi
+}
+
+function getsep() {
+    perl -ne '++$h{$1}{$.}while/([,;:!|\t\/\$])/g;
+END {
+  $min = -1;
+  while (($s,$rh)=each%h) {
+    @v=(values%$rh);
+    $sum=0;
+    $sum+=$_ foreach@v;
+    $avg=$sum/($#v+1);
+    $diff=0;
+    $diff+=abs($avg-$_)foreach@v;
+    if ($min<0||$diff<$min||$diff==$min&&$sum>$minsum) {
+      $min=$diff;
+      $minsum=$sum;
+      $sep=$s;
+    }
+  }
+  print"$sep\n";
+}' "$@"
+}
+
+# treats first arg as a list of headers
+# maps second arg to corresponding header
+function lookup_fields() {
+    header="$1"
+    fields="$2"
+    perl -e '@h=split(/,/,"'"$header"'");%h=map{$h[$_]//$_=>$_}(0..$#h);print join(",",map{$h{$_}//$_}split(/,/,"'"$fields"'"))'
+}
+
+# expand a match for grep
+# alternatively, use perl and match each field individually
+function match_to_fields() {
+    fields="$1"
+    perl -e '$q=<>;chomp$q;$q=~s{(\\.|\[(?:\\.|[^\\\]])\]|[^.\\]|([.]))}{$2?"[^\t]":$1}ge;$q="[^\t]*$q"unless$q=~s/^\^//;$q.="([^\t]|\$)"if$q=~s/\$$//;@f=split(/,/,"'"$fields"'");print "^(",join("|", map{($_<=0?"^":"([^\t]*\t){$_}").$q}@f),")"'
+}
+
+# given a json array on each line of input, flattens the leading non-object
+# elements into a tsv row
+function splice_json() {
+    perl -pe 's/^\[//;s/\]$//;while(s{(^|\t)(?:"((?:[^"]|\\.)*)"|([^,{}""]*)),}{$1.($2//$3)."\t"}ge){}' "$@"
+}
+
+function csv2tsv() {
+    perl -CS -MText::CSV -e '
+ $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", binary=>1, allow_loose_quotes=>1});
+ %h=("\t" => "t", "\n" => "n");
+ while ($r=$csv->getline(*STDIN)) {
+   print join("\t", map {s/(["\t\n\\])/"\\".($h{$1}||$1)/ge; $_} @$r), "\n";
+ }
+ $csv->eof or $csv->error_diag();' "$@"
+}
+
+function tsv2csv() {
+    perl -CS -MText::CSV -F'\t' -ane 'BEGIN {
+   $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", eol=>"\n", binary=>1});
+   %h=("t" => "\t", "n" => "\n");
+ }
+ chomp @F;
+ $csv->print(*STDOUT, [map {s/\\(.)/$h{$1}||$1/ge; $_} @F]);' "$@"
+}
+
+########################################################################
+
+if [ "x$FORMAT" = "xauto" ]; then
+    reset_sources
+    if egrep . "${SOURCES[0]}" | head -1 | egrep -q ' *{'; then
+        FORMAT=json
+    else
+        SEPARATOR=$(head -5 "${SOURCES[0]}" | getsep)
+        if [ "x$SEPARATOR" = "x," ]; then
+            FORMAT=csv
+        elif [ "x$SEPARATOR" != "x" ]; then
+            FORMAT=tsv
+        else
+            echo "can't detect format, specify with -x/--format" >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [ "x$SEPARATOR" = 'x' ]; then
+    case "$FORMAT" in
+        tsv)
+            SEPARATOR=$'\t'
+            ;;
+        *)
+            SEPARATOR=','
+            ;;
+    esac
+fi
+
+case "$FORMAT" in
+    tsv)
+        if echo "$FIELDS" | egrep -vq '^([,~0-9]|[bdfgiMhnRrV]+:)*$'; then
+            if [ -z "$HEADER" ]; then
+                if [ -n "$NO_INPUT_HEADER" ]; then
+                    echo "error: no headers and fields referred to by name" >&2
+                    exit 1
+                fi
+                reset_sources
+                HEADER=$(head -1 "${SOURCES[0]}" | tr "$SEPARATOR" ,)
+            fi
+            FIELDS=$(lookup_fields "$HEADER" "$FIELDS")
+        fi
+        if [ -n "$NO_INPUT_HEADER" ]; then
+            SKIP="cat"
+        else
+            SKIP="tail --quiet -n +2"
+        fi
+        if [ -z "$NO_OUTPUT_HEADER" ]; then
+            echo "$HEADER" | tr , "$SEPARATOR"
+        fi
+        GREP_QUERY=$(echo "$QUERY" | match_to_fields "$FIELDS")
+        cat "${SOURCES[@]}" | $SKIP | egrep $IGNORE_CASE $INVERT_MATCH "$GREP_QUERY"
+        ;;
+    csv)
+        cat "${SOURCES[@]}" |\
+            csv2tsv |\
+            qgrep -x tsv -f "$FIELDS" "$QUERY" |\
+            tsv2csv
+        ;;
+    json)
+        JQ_FIELDS=$(perl -e 'print join(", ", map {s/^\w*://;".$_"} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        GREP_FIELDS=$(perl -e 'print join(",", map {s/^(\w*:)?.*/$1.$i++/e;$_} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        cat "${SOURCES[@]}" | jq -c "[$JQ_FIELDS, .]" |\
+            splice_json |\
+            qgrep -H -x tsv -f "$GREP_FIELDS" "$QUERY" |\
+            sed 's/.*\t//'
+        ;;
+    *)
+        echo "error: unknown format: $FORMAT (expected tsv, csv or json)" >&2
+        exit 1
+        ;;
+esac

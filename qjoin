@@ -1,0 +1,283 @@
+#!/bin/bash
+
+# A nicer join(1), allowing more than two files, supporting tsv, csv
+# and json.
+
+FORMAT=auto
+SEPARATOR=''
+FIELDS=()
+EXPR='1'
+SORTED=''
+HEADERS=()
+NO_INPUT_HEADER=''
+NO_OUTPUT_HEADER=''
+TMP=''
+ARGS=()
+SOURCES=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x|--format)
+            ARGS+=("$1" "$2")
+            FORMAT="$2"
+            shift
+            shift
+            ;;
+        -t|--separator)
+            ARGS+=("$1" "$2")
+            SEPARATOR="$2"
+            shift
+            shift
+            ;;
+        -f|--field)
+            ARGS+=("$1" "$2")
+            IFS='=' read -r -a FIELDS <<< "$2"
+            shift
+            shift
+            ;;
+        -e|--expr)
+            ARGS+=("$1" "$2")
+            EXPR="$2"
+            shift
+            shift
+            ;;
+        -S|--sorted)
+            ARGS+=("$1")
+            SORTED="$1"
+            shift
+            ;;
+        -h|--headers)
+            ARGS+=("$1" "$2")
+            HEADERS+=("$2")
+            shift
+            shift
+            ;;
+        -I|--no-input-header)
+            NO_INPUT_HEADER="1"
+            shift
+            ;;
+        -O|--no-output-header)
+            NO_OUTPUT_HEADER="1"
+            shift
+            ;;
+        -H|--no-headers)
+            NO_INPUT_HEADER="1"
+            NO_OUTPUT_HEADER="1"
+            shift
+            ;;
+        *)
+            SOURCES+=("$1")
+            shift
+            ;;
+    esac
+done
+
+########################################################################
+# recurse on 3 or more inputs
+
+NUM_SOURCES=${#SOURCES[@]}
+case "$NUM_SOURCES" in
+    0|1)
+        echo "error: at least two inputs required to join" >&2
+        exit 1
+        ;;
+    2)
+        ;;
+    *)
+        exec "$0" "${ARGS[@]}" "${SOURCES[0]}" \
+             <("$0" "${ARGS[@]}" "${SOURCES[@]:1}")
+        exit 0
+        ;;
+esac
+
+# there are two sources below
+
+########################################################################
+
+function finish() {
+    if [ -f "$TMP0" ]; then
+        rm -f "$TMP0"
+    fi
+    if [ -f "$TMP1" ]; then
+        rm -f "$TMP1"
+    fi
+}
+trap finish EXIT
+
+# ensures the inputss are plain files which can be read multiple times
+function reset_sources() {
+    if [ "${#SOURCES[@]}" -ge 1 ] && [ -f "${SOURCES[0]}" ] && [ -f "${SOURCES[1]}" ]; then
+        # nothing to do here - ensures idempotency
+        true
+    else
+        TMP0=$(mktemp)
+        TMP1=$(mktemp)
+        cp "${SOURCES[0]}" $TMP0
+        cp "${SOURCES[1]}" $TMP1
+        SOURCES=("$TMP0" "$TMP1")
+    fi
+}
+
+# infer the separator for a tsv or csv file
+function getsep() {
+    perl -ne '++$h{$1}{$.}while/([,;:!|\t\/\$])/g;
+END {
+  $min = -1;
+  while (($s,$rh)=each%h) {
+    @v=(values%$rh);
+    $sum=0;
+    $sum+=$_ foreach@v;
+    $avg=$sum/($#v+1);
+    $diff=0;
+    $diff+=abs($avg-$_)foreach@v;
+    if ($min<0||$diff<$min||$diff==$min&&$sum>$minsum) {
+      $min=$diff;
+      $minsum=$sum;
+      $sep=$s;
+    }
+  }
+  print"$sep\n";
+}' "$@"
+}
+
+# given a json array on each line of input, flattens the leading non-object
+# elements into a tsv row
+function splice_json() {
+    perl -pe 's/^\[//;s/\]$//;while(s{(^|\t)(?:"((?:[^"]|\\.)*)"|([^,{}""]*)),}{$1.($2//$3)."\t"}e){}' "$@"
+}
+
+function csv2tsv() {
+    perl -CS -MText::CSV -e '
+ $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", binary=>1, allow_loose_quotes=>1});
+ %h=("\t" => "t", "\n" => "n");
+ while ($r=$csv->getline(*STDIN)) {
+   print join("\t", map {s/(["\t\n\\])/"\\".($h{$1}||$1)/ge; $_} @$r), "\n";
+ }
+ $csv->eof or $csv->error_diag();' "$@"
+}
+
+function tsv2csv() {
+    perl -CS -MText::CSV -F'\t' -ane 'BEGIN {
+   $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", eol=>"\n", binary=>1});
+   %h=("t" => "\t", "n" => "\n");
+ }
+ chomp @F;
+ $csv->print(*STDOUT, [map {s/\\(.)/$h{$1}||$1/ge; $_} @F]);' "$@"
+}
+
+function joinedtsv2json() {
+    fields="$1"
+    shift
+    perl -CS -F'\t' -MTie::IxHash -ane 'BEGIN{%h=map{$i++=>$_}split(/,/,"'"$fields"'")}
+  chomp @F;
+  tie(%r, "Tie::IxHash", map{$h{$_} => $F[$_]}(0..$#F-2));
+  for $j (@F[$#F-1, $#F]) {
+    while ($j =~ /\"((?:[^"\\]|\\.)*)\"\s*:\s*(\"(?:(?:[^"\\]|\\.)*)\"|[.\w]+)/g) {
+      $r{$1} //= $2;
+    }
+  }
+  print "{", join(",", map{"\"$_\":$r{$_}"}(keys %r)),"}\n";' "$@"
+}
+
+########################################################################
+
+if [ "x$FORMAT" = "xauto" ]; then
+    reset_sources
+    if egrep . "${SOURCES[0]}" | head -1 | egrep -q ' *{'; then
+        FORMAT=json
+    else
+        SEPARATOR=$(head -5 "${SOURCES[0]}" | getsep)
+        if [ "x$SEPARATOR" = "x," ]; then
+            FORMAT=csv
+        elif [ "x$SEPARATOR" != "x" ]; then
+            FORMAT=tsv
+        else
+            echo "can't detect format, specify with -x/--format" >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [ "x$SEPARATOR" = 'x' ]; then
+    case "$FORMAT" in
+        tsv)
+            SEPARATOR=$'\t'
+            ;;
+        *)
+            SEPARATOR=','
+            ;;
+    esac
+fi
+if [ "$SEPARATOR" = $'\t' ]; then
+    PERL_SEP='\t'
+else
+    PERL_SEP="$SEPARATOR"
+fi
+
+FIELDS0="${FIELDS[0]}"
+FIELDS1="${FIELDS[1]:-$FIELDS0}"
+INDEXES0="$FIELDS0"
+INDEXES1="$FIELDS1"
+HEADERS0="${HEADERS[0]}"
+HEADERS1="${HEADERS[1]:-$HEADERS0}"
+
+case "$FORMAT" in
+    tsv)
+        if echo "$INDEXES0" | egrep -vq '^[-,0-9]*$'; then
+            if [ -z "${HEADERS0}" ]; then
+                if [ -n "$NO_INPUT_HEADER" ]; then
+                    echo "error: no headers and fields referred to by name" >&2
+                    exit 1
+                fi
+                reset_sources
+                HEADERS0=$(head -1 "${SOURCES[0]}" | csv2tsv | tr '\t' ,)
+            fi
+            INDEXES0=$(echo "${HEADERS0}" | tr , '\n' | nl | sed 's/^ *//' | grep $'\t'"$INDEXES0" | cut -f 1)
+        fi
+        if echo "$INDEXES1" | egrep -vq '^[-,0-9]*$'; then
+            if [ -z "${HEADERS1}" ]; then
+                if [ -n "$NO_INPUT_HEADER" ]; then
+                    echo "error: no headers and fields referred to by name" >&2
+                    exit 1
+                fi
+                reset_sources
+                HEADERS1=$(head -1 "${SOURCES[1]}" | csv2tsv | tr '\t' ,)
+            fi
+            INDEXES1=$(echo "${HEADERS1}" | tr , '\n' | nl | sed 's/^ *//' | grep $'\t'"$INDEXES1" | cut -f 1)
+        fi
+        if [ -z "$NO_OUTPUT_HEADER" ]; then
+            FIELDS_OUT0=$(echo -n "$HEADERS0" | tr , '\n' | grep -v "^$FIELDS0"'$' | tr '\n' , | sed 's/,$//')
+            FIELDS_OUT1=$(echo -n "$HEADERS1" | tr , '\n' | grep -v "^$FIELDS1"'$' | tr '\n' , | sed 's/,$//')
+            FIELDS_OUT="$FIELDS0,$FIELDS_OUT0,$FIELDS_OUT1"
+            echo "${FIELDS_OUT}" | tr , "$SEPARATOR"
+        fi
+        # TODO: support join on multiple fields
+        if [ -z "$SORTED" ]; then
+            join  -t "$SEPARATOR" -1 "$INDEXES0" -2 "$INDEXES1" \
+                  <(qsort -O -t "$SEPARATOR" -f "$FIELDS0" "${SOURCES[0]}") \
+                  <(qsort -O -t "$SEPARATOR" -f "$FIELDS1" "${SOURCES[1]}")
+        else
+            join  -t "$SEPARATOR" -1 "$INDEXES0" -2 "$INDEXES1" \
+                  "${SOURCES[0]}" "${SOURCES[1]}"
+        fi
+        ;;
+    csv)
+        qjoin -x tsv -t $'\t' -f "$FIELDS" \
+              <(csv2tsv "${SOURCES[0]}") \
+              <(csv2tsv "${SOURCES[1]}") |\
+            tsv2csv
+        ;;
+    json)
+        JQ_FIELDS0=$(perl -e 'print join(", ", map {s/^\w*://;".$_"} split(/\s*,\s*/, "'"$FIELDS0"'"))')
+        JQ_FIELDS1=$(perl -e 'print join(", ", map {s/^\w*://;".$_"} split(/\s*,\s*/, "'"$FIELDS1"'"))')
+        JOIN_FIELDS=$(perl -e 'print join(",", map {s/^(\w*:)?.*/$1.++$i/e;$_} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        join -t $'\t' -j "$JOIN_FIELDS" \
+              <(cat "${SOURCES[0]}" | jq -c "[$JQ_FIELDS0, .]" | splice_json) \
+              <(cat "${SOURCES[1]}" | jq -c "[$JQ_FIELDS0, .]" | splice_json) |\
+            joinedtsv2json "${FIELDS}"
+        ;;
+    *)
+        echo "error: unknown format: $FORMAT" >&2
+        exit 1
+        ;;
+esac

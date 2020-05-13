@@ -1,0 +1,256 @@
+#!/bin/bash
+
+# A nicer sort(1), supporting multiple named as well as indexed
+# fields, for tsv, csv and json.
+
+FORMAT=auto
+SEPARATOR=''
+FIELDS='0'
+HEADER=''
+NO_INPUT_HEADER=''
+NO_OUTPUT_HEADER=''
+TMP=''
+SOURCES=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x|--format)
+            FORMAT="$2"
+            shift
+            shift
+            ;;
+        -t|--separator)
+            SEPARATOR="$2"
+            shift
+            shift
+            ;;
+        -f|--field)
+            FIELDS="$2"
+            shift
+            shift
+            ;;
+        -h|--header)
+            HEADER="$2"
+            shift
+            shift
+            ;;
+        -I|--no-input-header)
+            NO_INPUT_HEADER="1"
+            shift
+            ;;
+        -O|--no-output-header)
+            NO_OUTPUT_HEADER="1"
+            shift
+            ;;
+        -H|--no-headers)
+            NO_INPUT_HEADER="1"
+            NO_OUTPUT_HEADER="1"
+            shift
+            ;;
+        *)
+            SOURCES+=("$1")
+            shift
+            ;;
+    esac
+done
+
+########################################################################
+
+function finish() {
+    if [ -f "$TMP" ]; then
+        rm -f "$TMP"
+    fi
+}
+trap finish EXIT
+
+# ensures first source is a plain file which can be read multiple times
+function reset_sources() {
+    if [ "${#SOURCES[@]}" -ge 1 ] && [ -f "${SOURCES[0]}" ]; then
+        # nothing to do here - ensures idempotency
+        true
+    else
+        TMP=$(mktemp)
+        BYTES="${QTOOLS_PREFETCH_SIZE:-4096}"
+        if [ "${#SOURCES[@]}" -ge 1 ]; then
+            dd bs=1 count="$BYTES" if="${SOURCES[0]}" of="$TMP" 2>/dev/null
+        else
+            dd bs=1 count="$BYTES" of="$TMP" 2>/dev/null
+            SOURCES=("/dev/stdin")
+        fi
+        SOURCES=("$TMP" "${SOURCES[@]}")
+    fi
+}
+
+function getsep() {
+    perl -ne '++$h{$1}{$.}while/([,;:!|\t\/\$])/g;
+END {
+  $min = -1;
+  while (($s,$rh)=each%h) {
+    @v=(values%$rh);
+    $sum=0;
+    $sum+=$_ foreach@v;
+    $avg=$sum/($#v+1);
+    $diff=0;
+    $diff+=abs($avg-$_)foreach@v;
+    if ($min<0||$diff<$min||$diff==$min&&$sum>$minsum) {
+      $min=$diff;
+      $minsum=$sum;
+      $sep=$s;
+    }
+  }
+  print"$sep\n";
+}' "$@"
+}
+
+# like sort(1) but allows multiple -k options
+function multisort() {
+    args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -k)
+                args+=("$1" "$2")
+                shift
+                shift
+                break
+                ;;
+            -k*)
+                args+=("$1")
+                shift
+                break
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    if [[ $# -gt 0 ]]; then
+        multisort "$@" | sort -t "$SEPARATOR" --stable "${args[@]}"
+    else
+        # first sort doesn't need to be stable
+        sort -t "$SEPARATOR" "${args[@]}"
+    fi
+}
+
+# treats first arg as a list of headers
+# maps second arg to corresponding header
+function lookup_fields() {
+    header="$1"
+    fields="$2"
+    perl -e '@h=split(/,/,"'"$header"'");%h=map{$h[$_]//$_=>$_}(0..$#h);print join(",",map{/^(\w+:)?(.*)/;"$1".($h{$2}//$2)}split(/,/,"'"$fields"'"))'
+}
+
+# expands a list of [options:]field,... to multisort options
+function expand_sorts() {
+    perl -e '$s="";  @f=split(/,/,"'"$1"'");
+  while (@f) {
+    $f = shift @f;
+    $f =~ s/^(?:(\w+):)?//;
+    $o = $1;
+    $a = $b = 1 + $f;
+    while (@f && (not $o) && $b==$f[0]) {
+      $b = 1 + shift @f;
+    }
+    $s .= ($o ? " -$o" : "") . " -k$a,$b";
+  }
+  print "$s"'
+}
+
+# given a json array on each line of input, flattens the leading non-object
+# elements into a tsv row
+function splice_json() {
+    perl -pe 's/^\[//;s/\]$//;while(s{(^|\t)(?:"((?:[^"]|\\.)*)"|([^,{}""]*)),}{$1.($2//$3)."\t"}e){}' "$@"
+}
+
+function csv2tsv() {
+    perl -CS -MText::CSV -e '
+ $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", binary=>1, allow_loose_quotes=>1});
+ %h=("\t" => "t", "\n" => "n");
+ while ($r=$csv->getline(*STDIN)) {
+   print join("\t", map {s/(["\t\n\\])/"\\".($h{$1}||$1)/ge; $_} @$r), "\n";
+ }
+ $csv->eof or $csv->error_diag();' "$@"
+}
+
+function tsv2csv() {
+    perl -CS -MText::CSV -F'\t' -ane 'BEGIN {
+   $csv=Text::CSV->new({sep_char => "'"$SEPARATOR"'", eol=>"\n", binary=>1});
+   %h=("t" => "\t", "n" => "\n");
+ }
+ chomp @F;
+ $csv->print(*STDOUT, [map {s/\\(.)/$h{$1}||$1/ge; $_} @F]);' "$@"
+}
+
+########################################################################
+
+if [ "x$FORMAT" = "xauto" ]; then
+    reset_sources
+    if egrep . "${SOURCES[0]}" | head -1 | egrep -q ' *{'; then
+        FORMAT=json
+    else
+        SEPARATOR=$(head -5 "${SOURCES[0]}" | getsep)
+        if [ "x$SEPARATOR" = "x," ]; then
+            FORMAT=csv
+        elif [ "x$SEPARATOR" != "x" ]; then
+            FORMAT=tsv
+        else
+            echo "can't detect format, specify with -x/--format" >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [ "x$SEPARATOR" = 'x' ]; then
+    case "$FORMAT" in
+        tsv)
+            SEPARATOR=$'\t'
+            ;;
+        *)
+            SEPARATOR=','
+            ;;
+    esac
+fi
+
+case "$FORMAT" in
+    tsv)
+        if echo "$FIELDS" | egrep -vq '^([,~0-9]|[bdfgiMhnRrV]+:)*$'; then
+            if [ -z "$HEADER" ]; then
+                if [ -n "$NO_INPUT_HEADER" ]; then
+                    echo "error: no headers and fields referred to by name" >&2
+                    exit 1
+                fi
+                reset_sources
+                HEADER=$(head -1 "${SOURCES[0]}" | tr "$SEPARATOR" ,)
+            fi
+            FIELDS=$(lookup_fields "$HEADER" "$FIELDS")
+        fi
+        SORTS=$(expand_sorts "$FIELDS")
+        if [ -n "$NO_INPUT_HEADER" ]; then
+            SKIP="cat"
+        else
+            SKIP="tail --quiet -n +2"
+        fi
+        if [ -z "$NO_OUTPUT_HEADER" ]; then
+            echo "$HEADER" | tr , "$SEPARATOR"
+        fi
+        cat "${SOURCES[@]}" | $SKIP | multisort $SORTS
+        ;;
+    csv)
+        cat "${SOURCES[@]}" |\
+            csv2tsv |\
+            qsort -x tsv -t $'\t' -f "$FIELDS" -h "$HEADER" |\
+            tsv2csv
+        ;;
+    json)
+        JQ_FIELDS=$(perl -e 'print join(", ", map {s/^\w*://;".$_"} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        SORT_FIELDS=$(perl -e 'print join(",", map {s/^(\w*:)?.*/$1.$i++/e;$_} split(/\s*,\s*/, "'"$FIELDS"'"))')
+        cat "${SOURCES[@]}" | jq -c "[$JQ_FIELDS, .]" |\
+            splice_json |\
+            qsort --no-headers -x tsv -t $'\t' -f "$SORT_FIELDS" |\
+            sed 's/.*\t//'
+        ;;
+    *)
+        echo "error: unknown format: $FORMAT (expected tsv, csv or json)" >&2
+        exit 1
+        ;;
+esac
