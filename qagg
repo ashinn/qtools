@@ -217,7 +217,7 @@ len=${#EXPR_ARRAY[@]}
 for (( i=0; i<$len; i++ )); do
     op=${OP_ARRAY[$i]}
     if [ "x$op" = "x" ]; then
-        op=${OP_ARRAY[-1]}
+        op=${OP_ARRAY[${#OP_ARRAY[@]}-1]}
     fi
     case "$op" in
         count)

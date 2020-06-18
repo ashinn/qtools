@@ -72,6 +72,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+function finish() {
+    if [ -f "$TMP0" ]; then
+        rm -f "$TMP0"
+    fi
+    if [ -f "$TMP1" ]; then
+        rm -f "$TMP1"
+    fi
+}
+trap finish EXIT
+
 ########################################################################
 # recurse on 3 or more inputs
 
@@ -84,25 +94,22 @@ case "$NUM_SOURCES" in
     2)
         ;;
     *)
-        exec "$0" "${ARGS[@]}" "${SOURCES[0]}" \
-             <("$0" "${ARGS[@]}" "${SOURCES[@]:1}")
-        exit 0
+        if uname | grep -qi Darwin; then
+            # workaround for osx
+            TMP0=$(mktemp)
+            "$0" "${ARGS[@]}" "${SOURCES[@]:1}" > "$TMP0"
+            exec "$0" "${ARGS[@]}" "${SOURCES[0]}" "$TMP0"
+        else
+            exec "$0" "${ARGS[@]}" "${SOURCES[0]}" \
+                 <("$0" "${ARGS[@]}" "${SOURCES[@]:1}")
+        fi
+        exit 0  # can't happen
         ;;
 esac
 
 # there are two sources below
 
 ########################################################################
-
-function finish() {
-    if [ -f "$TMP0" ]; then
-        rm -f "$TMP0"
-    fi
-    if [ -f "$TMP1" ]; then
-        rm -f "$TMP1"
-    fi
-}
-trap finish EXIT
 
 # ensures the inputss are plain files which can be read multiple times
 function reset_sources() {
