@@ -107,7 +107,7 @@ END {
     $sum+=$_ foreach@v;
     $avg=$sum/($#v+1);
     $diff=0;
-    $diff+=abs($avg-$_)foreach@v;
+    $diff+=abs($avg-$rh->{$_})for 1..$.;
     if ($min<0||$diff<$min||$diff==$min&&$sum>$minsum) {
       $min=$diff;
       $minsum=$sum;
